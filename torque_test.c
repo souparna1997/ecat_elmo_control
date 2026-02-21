@@ -1755,22 +1755,37 @@
 // End slaveinfo, close socket
 // End program
 
-
+#define _GNU_SOURCE
+#include <sched.h> // For CPU_SET, CPU_ZERO
 #include <stdio.h>
+#include <pthread.h>
 #include <string.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include "soem/soem.h"
 #include <signal.h>
+#include <time.h>
+#include <limits.h>
+#include <sys/mman.h>
 
 #define EC_TIMEOUTMON 500
+#define MAX_SAMPLES 10000 // Track 10 seconds of data at 1ms
+uint64_t latencies[MAX_SAMPLES];
+int sample_idx = 0;
 
 static char IOmap[4096];
 static ecx_contextt ctx;
-char ifname[] = "enp86s0";  // Change to your NIC
+char ifname[] = "enp8s0";  // Change to your NIC
 uint8_t slave = 1;
 uint16_t status_word_mask = 0x006F; // 0000 0000 0110 1111
 uint16_t sw;
+
+// Helper to get time in nanoseconds
+uint64_t get_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 volatile int run = 1;
 void stop_handler(int sig) { run = 0; }
@@ -2013,7 +2028,7 @@ void set_slave_operational(){
 // }
 void perform_drive_profile_torque(){
     // Set Commanding Torque
-    *target_torque = 400;
+    *target_torque = 200;
     // Set max torque
     *max_torque = 1000;
     *control_word &= ~(1 << control_bit_halt);
@@ -2024,7 +2039,7 @@ void perform_drive_profile_torque(){
         ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
         if (*status_word & (1 << 10)) {
-            printf("Target_reached\n");
+            //printf("Target_reached\n");
             torque_not_reached = false;
          }
     }
@@ -2033,6 +2048,31 @@ void perform_drive_profile_torque(){
 
 
 int main() {
+
+    // --- STEP 1: PIN TO CORE 7 ---
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(7, &cpuset);
+
+    // Use sched_setaffinity for the whole process
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == -1) {
+        perror("ERROR: Could not pin to Core 7");
+        // Don't exit, but we know it failed
+    } else {
+        printf("SUCCESS: Process pinned to Core 7\n");
+    }
+
+    // --- STEP 2: ELEVATE TO REAL-TIME PRIORITY ---
+    // This is vital to stay on the core without being kicked off by the kernel
+    struct sched_param param;
+    param.sched_priority = 80; 
+    if (sched_setscheduler(0, SCHED_FIFO, &param) == -1) {
+        perror("ERROR: sched_setscheduler (Run with sudo!)");
+    }
+
+    // --- STEP 3: PREVENT MEMORY SWAPPING ---
+    // This stops the OS from moving your data to disk, reducing jitter
+    mlockall(MCL_CURRENT | MCL_FUTURE);
 
     signal(SIGINT, stop_handler);
     printf("Starting SOEM with default PDO control...\n");
@@ -2161,23 +2201,48 @@ int main() {
 
     // Main cyclic loop
     int index = 0;
+
+    // --- PREPARE THE ABSOLUTE TIMER ---
+    struct timespec next_period;
+    const uint64_t interval_ns = 2000000; // 2ms in nanoseconds
+    clock_gettime(CLOCK_MONOTONIC, &next_period);
+    uint64_t last_time = get_ns();
+    uint64_t current_time;
     
     while (run) {
-        
+
+        // 1. Calculate the next absolute wake-up time
+        next_period.tv_nsec += interval_ns;
+        while (next_period.tv_nsec >= 1000000000) {
+            next_period.tv_nsec -= 1000000000;
+            next_period.tv_sec++;
+        }
+
+        // 2. Sleep until that absolute time point
+        // This compensates for code execution time automatically
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_period, NULL);
+
+        // 3. Timing Measurement (Capture start of cycle)
+        current_time = get_ns();
+        if (sample_idx < MAX_SAMPLES) {
+            latencies[sample_idx++] = current_time - last_time;
+        }
+        last_time = current_time;
+
         ecx_send_processdata(&ctx);
         ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
         if (index == 200) {  // print diagnostics every 200 cycles (~2s)
-            printf("Torque commanded: %d\n", *target_torque);
-            printf("Torque Act: %d\n", *torque_actual_value);
-            printf("Statusword: %d\n", *status_word);
-            printf("Ctrl Wrd: %d\n", *control_word);
-            printf("Operation mode: %d\n", *operation_mode_display);
+            //printf("Torque commanded: %d\n", *target_torque);
+            //printf("Torque Act: %d\n", *torque_actual_value);
+            //printf("Statusword: %d\n", *status_word);
+            //printf("Ctrl Wrd: %d\n", *control_word);
+            //printf("Operation mode: %d\n", *operation_mode_display);
             index = 0;
         }
         index++;
 
-        osal_usleep(10000); // 10ms cycle
+        //osal_usleep(1000); // 1ms cycle
     }
 
     *control_word |= (1 << control_bit_halt); // Stop commanding torque to the motor
@@ -2203,6 +2268,25 @@ int main() {
         printf("Switch_on_disabled\n");
     }
     osal_usleep(10000); // 10ms cycle
+
+    // --- Post-Execution Analysis ---
+    uint64_t min_lat = ULLONG_MAX, max_lat = 0, total_lat = 0;
+    
+    printf("\n--- Timing Analysis (Nanoseconds) ---\n");
+    for (int i = 1; i < sample_idx; i++) { // Skip index 0 as it has no previous reference
+        if (latencies[i] < min_lat) min_lat = latencies[i];
+        if (latencies[i] > max_lat) max_lat = latencies[i];
+        total_lat += latencies[i];
+    }
+
+    if (sample_idx > 1) {
+        double avg = (double)total_lat / (sample_idx - 1);
+        printf("Samples collected: %d\n", sample_idx - 1);
+        printf("Average Cycle: %.2f ns (%.3f ms)\n", avg, avg / 1000000.0);
+        printf("Minimum Cycle: %" PRIu64 " ns\n", min_lat);
+        printf("Maximum Cycle: %" PRIu64 " ns\n", max_lat);
+        printf("Jitter (Max - Min): %" PRIu64 " ns\n", max_lat - min_lat);
+    }
 
     ecx_close(&ctx);
     
