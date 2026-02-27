@@ -1767,6 +1767,9 @@
 #include <time.h>
 #include <limits.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include "shared_data.h" // Single Producer Single Consumer Circular Buffer
 
 #define EC_TIMEOUTMON 500
 #define MAX_SAMPLES 10000 // Track 10 seconds of data at 1ms
@@ -2028,7 +2031,7 @@ void set_slave_operational(){
 // }
 void perform_drive_profile_torque(){
     // Set Commanding Torque
-    *target_torque = 200;
+    *target_torque = 75;
     // Set max torque
     *max_torque = 1000;
     *control_word &= ~(1 << control_bit_halt);
@@ -2044,6 +2047,41 @@ void perform_drive_profile_torque(){
          }
     }
     
+}
+
+// Create Shared Memory
+
+SharedMemory* shm_ptr;
+
+void init_shared_memory()
+{
+    int fd = shm_open("/motor_shm", O_CREAT | O_RDWR, 0666);
+    ftruncate(fd, sizeof(SharedMemory));
+
+    shm_ptr = (SharedMemory*)mmap(
+        NULL,
+        sizeof(SharedMemory),
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        fd,
+        0);
+
+    shm_ptr->write_index = 0;
+}
+
+// Single Writer Function
+
+void write_sample(int16_t torque_cmd,
+                  int16_t torque_actual,
+                  uint64_t timestamp)
+{
+    uint32_t index = shm_ptr->write_index;
+
+    shm_ptr->buffer[index % BUFFER_SIZE].torque_cmd = torque_cmd;
+    shm_ptr->buffer[index % BUFFER_SIZE].torque_actual = torque_actual;
+    shm_ptr->buffer[index % BUFFER_SIZE].timestamp = timestamp;
+
+    shm_ptr->write_index = index + 1;
 }
 
 
@@ -2072,7 +2110,12 @@ int main() {
 
     // --- STEP 3: PREVENT MEMORY SWAPPING ---
     // This stops the OS from moving your data to disk, reducing jitter
-    mlockall(MCL_CURRENT | MCL_FUTURE);
+    // 1. Lock memory
+    // mlockall(MCL_CURRENT | MCL_FUTURE);
+
+    // if(mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
+    //     perror("mlockall failed");
+    // }
 
     signal(SIGINT, stop_handler);
     printf("Starting SOEM with default PDO control...\n");
@@ -2204,11 +2247,15 @@ int main() {
 
     // --- PREPARE THE ABSOLUTE TIMER ---
     struct timespec next_period;
-    const uint64_t interval_ns = 2000000; // 2ms in nanoseconds
+    const uint64_t interval_ns = 1000000; // 0.5ms in nanoseconds
     clock_gettime(CLOCK_MONOTONIC, &next_period);
     uint64_t last_time = get_ns();
     uint64_t current_time;
     
+    // Initialize shared memory before starting 
+
+    init_shared_memory();
+
     while (run) {
 
         // 1. Calculate the next absolute wake-up time
@@ -2238,11 +2285,16 @@ int main() {
             //printf("Statusword: %d\n", *status_word);
             //printf("Ctrl Wrd: %d\n", *control_word);
             //printf("Operation mode: %d\n", *operation_mode_display);
+            write_sample(*target_torque, *torque_actual_value, current_time);
             index = 0;
         }
         index++;
 
         //osal_usleep(1000); // 1ms cycle
+
+        // Write to the shared memory
+        // write_sample(*target_torque, *torque_actual_value, current_time);
+    
     }
 
     *control_word |= (1 << control_bit_halt); // Stop commanding torque to the motor
@@ -2268,6 +2320,9 @@ int main() {
         printf("Switch_on_disabled\n");
     }
     osal_usleep(10000); // 10ms cycle
+
+    // When shutting down RT
+    shm_unlink("/motor_shm");
 
     // --- Post-Execution Analysis ---
     uint64_t min_lat = ULLONG_MAX, max_lat = 0, total_lat = 0;
