@@ -11,4 +11,4 @@ find_package(soem REQUIRED)
 
 add_executable(torque_test torque_test.c)
 target_link_libraries(torque_test soem)
-target_include_directories(torque_test PRIVATE "/home/maestro/Projects/shared_include")
+target_include_directories(torque_test PRIVATE "/home/maestro/Projects/ecat_elmo_control/shared_include")

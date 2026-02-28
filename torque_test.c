@@ -1857,14 +1857,17 @@ void mapMappedPDOparameters()
 }
 
 // PID variables
-double Kp = 40;  // Proportional Gain
-double Ki = 0.1;  // Integral Gain
-double Kd = 0.01; // Derivative Gain
+double Kp = 0.15;  // Proportional Gain
+double Ki = 0.005;  // Integral Gain
+double Kd = 0.0; // Derivative Gain
 
+int16_t torque_setpoint = 75; // The actual goal
 int16_t error = 0;
 int16_t last_error = 0;
 double integral = 0;
 double derivative = 0;
+double filtered_actual = 0;
+double alpha = 0.05; // Smoothing factor (0.05 to 0.2 is typical)
 
 // void setModeHoming(){
 
@@ -2044,7 +2047,7 @@ void set_slave_operational(){
 // }
 void perform_drive_profile_torque(){
     // Set Commanding Torque
-    *target_torque = 75;
+    *target_torque = torque_setpoint;
     // Set max torque
     *max_torque = 1000;
     *control_word &= ~(1 << control_bit_halt);
@@ -2063,27 +2066,38 @@ void perform_drive_profile_torque(){
 }
 
 // PID Controller function for closed loop torque control
-void update_closed_loop() {
-    // 1. Calculate Error
-    error = (*target_torque) - (*torque_actual_value);
+void update_closed_loop(int16_t setpoint) {
 
-    // 2. Calculate Integral (with anti-windup)
+    // 1. Smooth the feedback (Critical for Torque)
+    // This stops the PID from reacting to every tiny electrical spike
+    filtered_actual = (alpha * (double)(*torque_actual_value)) + (1.0 - alpha) * filtered_actual;
+
+    // 2. Calculate Error
+    error = setpoint - (int16_t)filtered_actual;
+
+    // Inside update_closed_loop
+    if (abs(error) < 5) {
+        error = 0; // Don't react to tiny noise
+    }
+
+    // 3. Calculate Integral (with anti-windup)
     integral += error;
-    if (integral > 1000) integral = 1000; 
-    if (integral < -1000) integral = -1000;
+    if (integral > 500) integral = 500; 
+    if (integral < -500) integral = -500;
 
-    // 3. Calculate Derivative
+    // 4. Calculate Derivative
     derivative = error - last_error;
     last_error = error;
 
-    // 4. PID Output
+    // 5. PID Output
     int32_t output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+    int32_t final_command = torque_setpoint + output; // Feed-forward
 
-    // 5. Apply Output (with safety limits)
-    if (output > 1000) output = 1000; // Max motor torque limit
-    if (output < -1000) output = -1000;
+    // 6. Apply Output (with safety limits)
+    if (final_command > 1000) final_command = 1000; // Max motor torque limit
+    if (final_command < -1000) final_command = -1000;
 
-    *target_torque = (int16_t)output;
+    *target_torque = (int16_t)final_command;
 }
 
 // Create Shared Memory
@@ -2316,15 +2330,15 @@ int main() {
 
         // Perform Closed Loop torque control
         if (CLOSED_LOOP_TORQUE_CONTROL_ENABLED){
-            update_closed_loop();
+            update_closed_loop(torque_setpoint);
         }
 
         ecx_send_processdata(&ctx);
         ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
         if (index == 200) {  // print diagnostics every 200 cycles (~2s)
-            //printf("Torque commanded: %d\n", *target_torque);
-            //printf("Torque Act: %d\n", *torque_actual_value);
+            printf("Torque commanded: %d\n", *target_torque);
+            printf("Torque Act: %d\n", *torque_actual_value);
             //printf("Statusword: %d\n", *status_word);
             //printf("Ctrl Wrd: %d\n", *control_word);
             //printf("Operation mode: %d\n", *operation_mode_display);
