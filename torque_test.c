@@ -1770,6 +1770,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "shared_data.h" // Single Producer Single Consumer Circular Buffer
+#include <stdlib.h>
 
 #define EC_TIMEOUTMON 500
 #define MAX_SAMPLES 10000 // Track 10 seconds of data at 1ms
@@ -1782,6 +1783,8 @@ char ifname[] = "enp8s0";  // Change to your NIC
 uint8_t slave = 1;
 uint16_t status_word_mask = 0x006F; // 0000 0000 0110 1111
 uint16_t sw;
+
+bool CLOSED_LOOP_TORQUE_CONTROL_ENABLED = true;
 
 // Helper to get time in nanoseconds
 uint64_t get_ns() {
@@ -1852,6 +1855,16 @@ void mapMappedPDOparameters()
     control_word = (uint16_t *)(ctx.slavelist[1].outputs + 12);                           // Control word;
     operation_mode = (int8_t *)(ctx.slavelist[1].outputs + 14);                          // Mode of operation;
 }
+
+// PID variables
+double Kp = 40;  // Proportional Gain
+double Ki = 0.1;  // Integral Gain
+double Kd = 0.01; // Derivative Gain
+
+int16_t error = 0;
+int16_t last_error = 0;
+double integral = 0;
+double derivative = 0;
 
 // void setModeHoming(){
 
@@ -2047,6 +2060,30 @@ void perform_drive_profile_torque(){
          }
     }
     
+}
+
+// PID Controller function for closed loop torque control
+void update_closed_loop() {
+    // 1. Calculate Error
+    error = (*target_torque) - (*torque_actual_value);
+
+    // 2. Calculate Integral (with anti-windup)
+    integral += error;
+    if (integral > 1000) integral = 1000; 
+    if (integral < -1000) integral = -1000;
+
+    // 3. Calculate Derivative
+    derivative = error - last_error;
+    last_error = error;
+
+    // 4. PID Output
+    int32_t output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+    // 5. Apply Output (with safety limits)
+    if (output > 1000) output = 1000; // Max motor torque limit
+    if (output < -1000) output = -1000;
+
+    *target_torque = (int16_t)output;
 }
 
 // Create Shared Memory
@@ -2250,6 +2287,7 @@ int main() {
     const uint64_t interval_ns = 1000000; // 0.5ms in nanoseconds
     clock_gettime(CLOCK_MONOTONIC, &next_period);
     uint64_t last_time = get_ns();
+    uint64_t last_write_time = get_ns();
     uint64_t current_time;
     
     // Initialize shared memory before starting 
@@ -2276,6 +2314,11 @@ int main() {
         }
         last_time = current_time;
 
+        // Perform Closed Loop torque control
+        if (CLOSED_LOOP_TORQUE_CONTROL_ENABLED){
+            update_closed_loop();
+        }
+
         ecx_send_processdata(&ctx);
         ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
@@ -2285,7 +2328,6 @@ int main() {
             //printf("Statusword: %d\n", *status_word);
             //printf("Ctrl Wrd: %d\n", *control_word);
             //printf("Operation mode: %d\n", *operation_mode_display);
-            write_sample(*target_torque, *torque_actual_value, current_time);
             index = 0;
         }
         index++;
@@ -2293,6 +2335,10 @@ int main() {
         //osal_usleep(1000); // 1ms cycle
 
         // Write to the shared memory
+        if (abs(current_time - last_write_time) >= 1000000000){
+            write_sample(*target_torque, *torque_actual_value, current_time);
+            last_write_time = current_time;
+        }
         // write_sample(*target_torque, *torque_actual_value, current_time);
     
     }
