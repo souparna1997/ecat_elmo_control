@@ -2349,7 +2349,7 @@ int main() {
         //osal_usleep(1000); // 1ms cycle
 
         // Write to the shared memory
-        if (abs(current_time - last_write_time) >= 1000000000){
+        if ((current_time - last_write_time) >= 500000000ULL){
             write_sample(*target_torque, *torque_actual_value, current_time);
             last_write_time = current_time;
         }
@@ -2380,9 +2380,6 @@ int main() {
         printf("Switch_on_disabled\n");
     }
     osal_usleep(10000); // 10ms cycle
-
-    // When shutting down RT
-    shm_unlink("/motor_shm");
 
     // --- Post-Execution Analysis ---
     uint64_t min_lat = ULLONG_MAX, max_lat = 0, total_lat = 0;
